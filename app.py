@@ -223,3 +223,95 @@ try:
 
 except Exception as e:
     st.error(f"Chart error: {e}")
+
+# ==========================================
+# SEC FILINGS INTELLIGENCE
+# ==========================================
+
+from sec_filings import get_watchlist_filings
+
+st.divider()
+st.header("🏛️ SEC Filings Intelligence")
+
+st.caption(
+    "Official SEC EDGAR filings for your eight monitored companies"
+)
+
+if st.button("🔄 Refresh SEC Filings"):
+    st.cache_data.clear()
+
+try:
+    with st.spinner("Retrieving SEC filings..."):
+
+        filings = get_watchlist_filings()
+
+    if not filings.empty:
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric("Total filings", len(filings))
+
+        with col2:
+            st.metric(
+                "Companies covered",
+                filings["Ticker"].nunique()
+            )
+
+        with col3:
+            st.metric(
+                "Latest filing",
+                filings["Filing Date"].max()
+            )
+
+        st.subheader("Recent Company Filings")
+
+        selected_ticker = st.selectbox(
+            "Filter by company",
+            ["All Companies"] + stocks,
+            key="sec_ticker_filter"
+        )
+
+        selected_form = st.multiselect(
+            "Filing types",
+            sorted(filings["Form"].unique()),
+            default=sorted(filings["Form"].unique())
+        )
+
+        filtered = filings.copy()
+
+        if selected_ticker != "All Companies":
+            filtered = filtered[
+                filtered["Ticker"] == selected_ticker
+            ]
+
+        filtered = filtered[
+            filtered["Form"].isin(selected_form)
+        ]
+
+        st.dataframe(
+            filtered[
+                [
+                    "Ticker",
+                    "Company",
+                    "Form",
+                    "Filing Date",
+                    "Description",
+                    "URL"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "URL": st.column_config.LinkColumn(
+                    "SEC Document",
+                    display_text="Open Filing"
+                )
+            }
+        )
+
+    else:
+        st.info("No recent filings found.")
+
+except Exception as e:
+    st.error(f"SEC filing retrieval failed: {e}")
