@@ -608,20 +608,46 @@ with tabs[5]:
             for item in result.get("items", []):
                 all_news.append({**item, "Ticker": symbol})
         if all_news:
-            news_df = pd.DataFrame(all_news).drop_duplicates(subset=["url"])
-            if "published" in news_df:
-                news_df["_sort_date"] = pd.to_datetime(news_df["published"], errors="coerce", utc=True)
-                news_df = news_df.sort_values("_sort_date", ascending=False, na_position="last")
-            for _, item in news_df.iterrows():
+            # Merge syndicated copies by canonical URL, while preserving every
+            # selected ticker associated with the same article.
+            grouped = {}
+            for article in all_news:
+                url = str(article.get("url") or "").strip()
+                if not url:
+                    continue
+                key = url.rstrip("/").lower()
+                if key not in grouped:
+                    grouped[key] = {**article, "Tickers": set()}
+                grouped[key]["Tickers"].add(str(article.get("Ticker") or ""))
+            news_rows = list(grouped.values())
+
+            def news_sort_key(article):
+                value = article.get("published", "")
+                try:
+                    if isinstance(value, (int, float)) and value > 10**9:
+                        return pd.to_datetime(value, unit="s", utc=True)
+                    return pd.to_datetime(value, errors="coerce", utc=True)
+                except Exception:
+                    return pd.NaT
+
+            news_rows.sort(
+                key=lambda article: (
+                    pd.isna(news_sort_key(article)),
+                    news_sort_key(article) if pd.notna(news_sort_key(article))
+                    else pd.Timestamp.min.tz_localize("UTC")
+                ),
+                reverse=True,
+            )
+            for item in news_rows:
                 title = str(item.get("title") or "Untitled article")
                 url = str(item.get("url") or "")
                 publisher = str(item.get("publisher") or "News source")
                 published = str(item.get("published") or "")
-                ticker_label = str(item.get("Ticker") or "")
+                ticker_label = ", ".join(sorted(t for t in item["Tickers"] if t))
                 if url:
                     st.markdown(f"- **{ticker_label}** · [{title}]({url}) — *{publisher}* · {published}")
         else:
-            st.warning("No articles were retrieved from the configured news sources.")
+            st.warning("No relevant articles were retrieved. Check feed diagnostics below.")
         with st.expander("News feed diagnostics"):
             st.dataframe(pd.DataFrame(source_status), use_container_width=True, hide_index=True)
     st.divider()
