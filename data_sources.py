@@ -50,47 +50,94 @@ def fetch_company_info(ticker: str) -> dict:
         return {}
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_news(ticker: str) -> list:
-    """Get Yahoo Finance news, with Google News RSS as a fallback."""
-    out = []
-    try:
-        items = yf.Ticker(ticker).news or []
-        for item in items[:15]:
-            content = item.get("content", item)
-            title = content.get("title") or item.get("title")
-            if not title:
-                continue
-            url = content.get("canonicalUrl", {}).get("url") or item.get("link") or ""
-            provider = content.get("provider", {}).get("displayName") or item.get("publisher") or "Yahoo Finance"
-            if url:
-                out.append({"title": title, "url": url, "publisher": provider, "published": ""})
-    except Exception:
-        pass
+def fetch_news_diagnostics(ticker: str) -> dict:
+    """Fetch company news from Yahoo, Google News RSS, then Bing News RSS."""
+    import xml.etree.ElementTree as ET
+    from urllib.parse import quote
 
-    if out:
-        return out
-
+    items = []
+    sources_checked = []
+    errors = []
+    query = quote(f"{ticker} stock")
+    
+    # Yahoo Finance is attempted first; its response format varies by yfinance version.
+    sources_checked.append("Yahoo Finance")
     try:
-        import xml.etree.ElementTree as ET
-        from urllib.parse import quote
-        query = quote(f"{ticker} stock")
-        response = requests.get(
-            f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en",
-            headers={"User-Agent": "Mozilla/5.0 StockIntelligenceDashboard/1.0"},
-            timeout=12,
-        )
-        response.raise_for_status()
-        root = ET.fromstring(response.content)
-        for item in root.findall("./channel/item")[:15]:
-            title = item.findtext("title") or ""
-            url = item.findtext("link") or ""
-            publisher = item.findtext("source") or "Google News"
-            published = item.findtext("pubDate") or ""
+        raw_items = yf.Ticker(ticker).news or []
+        for raw in raw_items[:15]:
+            content = raw.get("content", raw)
+            title = content.get("title") or raw.get("title")
+            url = content.get("canonicalUrl", {}).get("url") or raw.get("link") or ""
+            provider = content.get("provider", {}).get("displayName") or raw.get("publisher") or "Yahoo Finance"
             if title and url:
-                out.append({"title": title, "url": url, "publisher": publisher, "published": published})
-    except Exception:
-        pass
-    return out
+                items.append({
+                    "title": title, "url": url, "publisher": provider,
+                    "published": content.get("pubDate") or raw.get("providerPublishTime") or "",
+                    "source": "Yahoo Finance",
+                })
+    except Exception as exc:
+        errors.append(f"Yahoo Finance: {type(exc).__name__}: {str(exc)[:180]}")
+
+    if items:
+        return {
+            "items": items[:20], "sources_checked": sources_checked,
+            "status": "Articles found", "diagnostic": "Yahoo Finance returned articles."
+        }
+
+    rss_sources = [
+        (
+            "Google News RSS",
+            f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en",
+        ),
+        (
+            "Bing News RSS",
+            f"https://www.bing.com/news/search?q={query}&format=RSS",
+        ),
+    ]
+    for source_name, url in rss_sources:
+        sources_checked.append(source_name)
+        try:
+            response = requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; StockIntelligenceDashboard/1.0)"},
+                timeout=15,
+            )
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            parsed = []
+            for entry in root.findall("./channel/item")[:15]:
+                title = entry.findtext("title") or ""
+                link = entry.findtext("link") or ""
+                publisher = entry.findtext("source") or source_name
+                published = entry.findtext("pubDate") or ""
+                if title and link:
+                    parsed.append({
+                        "title": title, "url": link, "publisher": publisher,
+                        "published": published, "source": source_name,
+                    })
+            if parsed:
+                items.extend(parsed)
+                break
+            errors.append(f"{source_name}: feed responded but contained no readable articles")
+        except Exception as exc:
+            errors.append(f"{source_name}: {type(exc).__name__}: {str(exc)[:180]}")
+
+    status = "Articles found" if items else "All sources unavailable or empty"
+    diagnostic = " | ".join(errors) if errors else (
+        "At least one configured source returned articles." if items
+        else "Sources returned no articles and no detailed error."
+    )
+    return {
+        "items": items[:30],
+        "sources_checked": sources_checked,
+        "status": status,
+        "diagnostic": diagnostic,
+    }
+
+
+def fetch_news(ticker: str) -> list:
+    """Backward-compatible simple news-list interface."""
+    return fetch_news_diagnostics(ticker).get("items", [])
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_holders(ticker: str) -> dict:
