@@ -49,22 +49,48 @@ def fetch_company_info(ticker: str) -> dict:
     except Exception:
         return {}
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_news(ticker: str) -> list:
+    """Get Yahoo Finance news, with Google News RSS as a fallback."""
+    out = []
     try:
         items = yf.Ticker(ticker).news or []
-        out = []
         for item in items[:15]:
             content = item.get("content", item)
             title = content.get("title") or item.get("title")
             if not title:
                 continue
             url = content.get("canonicalUrl", {}).get("url") or item.get("link") or ""
-            provider = content.get("provider", {}).get("displayName") or item.get("publisher") or "News source"
-            out.append({"title": title, "url": url, "publisher": provider})
-        return out
+            provider = content.get("provider", {}).get("displayName") or item.get("publisher") or "Yahoo Finance"
+            if url:
+                out.append({"title": title, "url": url, "publisher": provider, "published": ""})
     except Exception:
-        return []
+        pass
+
+    if out:
+        return out
+
+    try:
+        import xml.etree.ElementTree as ET
+        from urllib.parse import quote
+        query = quote(f"{ticker} stock")
+        response = requests.get(
+            f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en",
+            headers={"User-Agent": "Mozilla/5.0 StockIntelligenceDashboard/1.0"},
+            timeout=12,
+        )
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        for item in root.findall("./channel/item")[:15]:
+            title = item.findtext("title") or ""
+            url = item.findtext("link") or ""
+            publisher = item.findtext("source") or "Google News"
+            published = item.findtext("pubDate") or ""
+            if title and url:
+                out.append({"title": title, "url": url, "publisher": publisher, "published": published})
+    except Exception:
+        pass
+    return out
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_holders(ticker: str) -> dict:
