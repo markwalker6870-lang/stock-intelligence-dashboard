@@ -7,7 +7,7 @@ from streamlit_autorefresh import st_autorefresh
 
 from data_sources import (
     WATCHLIST, fetch_history, fetch_quote, fetch_company_info,
-    fetch_news, fetch_holders
+    fetch_news_diagnostics, fetch_holders
 )
 from analysis import add_indicators, technical_snapshot
 from sec_filings import (
@@ -515,30 +515,115 @@ with tabs[3]:
         st.error(f"Form 4 parsing issue: {e}")
 
 with tabs[4]:
-    st.subheader(f"{ticker} • Fundamentals and ownership")
-    info = fetch_company_info(ticker)
-    if info:
-        a,b,c,d = st.columns(4)
-        a.metric("Market cap", f"${info['marketCap']/1e9:.2f}B" if isinstance(info.get("marketCap"),(int,float)) else "—")
-        b.metric("Trailing P/E", f"{info['trailingPE']:.2f}" if isinstance(info.get("trailingPE"),(int,float)) else "—")
-        c.metric("Forward P/E", f"{info['forwardPE']:.2f}" if isinstance(info.get("forwardPE"),(int,float)) else "—")
-        d.metric("Profit margin", f"{info['profitMargins']*100:.1f}%" if isinstance(info.get("profitMargins"),(int,float)) else "—")
-        st.write("**Sector:**",info.get("sector") or "Not available"," • **Industry:**",info.get("industry") or "Not available")
-        st.caption("Fundamental fields are provider-supplied and may be missing, stale or not comparable across companies.")
-    holders = fetch_holders(ticker)
-    h1,h2,h3 = st.tabs(["Institutional holders","Major holders","Insider transactions (provider data)"])
-    with h1: st.dataframe(holders["institutional"],use_container_width=True,hide_index=True)
-    with h2: st.dataframe(holders["major"],use_container_width=True,hide_index=True)
-    with h3: st.dataframe(holders["insiders"],use_container_width=True,hide_index=True)
+    st.subheader("Fundamentals & ownership — watchlist comparison")
+    st.caption("Compare all watchlist companies together. Provider fields can be missing, delayed or inconsistent between issuers.")
+    fundamental_rows = []
+    for symbol in WATCHLIST:
+        try:
+            item = fetch_company_info(symbol) or {}
+            fundamental_rows.append({
+                "Ticker": symbol,
+                "Company": item.get("longName") or symbol,
+                "Sector": item.get("sector") or "—",
+                "Industry": item.get("industry") or "—",
+                "Market cap (USD)": item.get("marketCap"),
+                "Trailing P/E": item.get("trailingPE"),
+                "Forward P/E": item.get("forwardPE"),
+                "Profit margin": item.get("profitMargins"),
+                "Debt / equity": item.get("debtToEquity"),
+                "Return on equity": item.get("returnOnEquity"),
+            })
+        except Exception as exc:
+            fundamental_rows.append({"Ticker": symbol, "Company": symbol, "Data status": str(exc)[:120]})
+    fundamentals = pd.DataFrame(fundamental_rows)
+    if not fundamentals.empty:
+        st.dataframe(
+            fundamentals,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Market cap (USD)": st.column_config.NumberColumn(format="$%.0f"),
+                "Trailing P/E": st.column_config.NumberColumn(format="%.2f"),
+                "Forward P/E": st.column_config.NumberColumn(format="%.2f"),
+                "Profit margin": st.column_config.NumberColumn(format="%.1%"),
+                "Debt / equity": st.column_config.NumberColumn(format="%.2f"),
+                "Return on equity": st.column_config.NumberColumn(format="%.1%"),
+            },
+        )
+    st.divider()
+    st.markdown("#### Ownership details")
+    holder_symbols = st.multiselect(
+        "Companies to inspect",
+        WATCHLIST,
+        default=[ticker],
+        key="fundamentals_holder_symbols",
+    )
+    for symbol in holder_symbols:
+        st.markdown(f"**{symbol} — ownership**")
+        holders = fetch_holders(symbol)
+        h1, h2, h3 = st.tabs([
+            f"{symbol} institutional", f"{symbol} major holders", f"{symbol} insider data"
+        ])
+        with h1:
+            if holders["institutional"].empty:
+                st.info("Institutional-holder data is not available from the current provider.")
+            else:
+                st.dataframe(holders["institutional"], use_container_width=True, hide_index=True)
+        with h2:
+            if holders["major"].empty:
+                st.info("Major-holder data is not available from the current provider.")
+            else:
+                st.dataframe(holders["major"], use_container_width=True, hide_index=True)
+        with h3:
+            if holders["insiders"].empty:
+                st.info("Provider insider-transaction data is not available.")
+            else:
+                st.dataframe(holders["insiders"], use_container_width=True, hide_index=True)
 
 with tabs[5]:
-    st.subheader(f"{ticker} • News & research")
-    news = fetch_news(ticker)
-    if news:
-        for item in news:
-            st.markdown(f"- [{item['title']}]({item['url']}) — *{item['publisher']}*")
+    st.subheader("News & research — watchlist")
+    news_symbols = st.multiselect(
+        "Companies",
+        WATCHLIST,
+        default=WATCHLIST,
+        key="news_watchlist_symbols",
+    )
+    if st.button("Refresh news feeds", key="refresh_news_feeds"):
+        st.cache_data.clear()
+        st.rerun()
+    if not news_symbols:
+        st.info("Select at least one company to view its news.")
     else:
-        st.info("No news items returned by the data provider.")
+        all_news = []
+        source_status = []
+        for symbol in news_symbols:
+            result = fetch_news_diagnostics(symbol)
+            source_status.append({
+                "Ticker": symbol,
+                "Articles": len(result.get("items", [])),
+                "Sources checked": ", ".join(result.get("sources_checked", [])) or "None",
+                "Status": result.get("status", "Unknown"),
+                "Details": result.get("diagnostic", ""),
+            })
+            for item in result.get("items", []):
+                all_news.append({**item, "Ticker": symbol})
+        if all_news:
+            news_df = pd.DataFrame(all_news).drop_duplicates(subset=["url"])
+            if "published" in news_df:
+                news_df["_sort_date"] = pd.to_datetime(news_df["published"], errors="coerce", utc=True)
+                news_df = news_df.sort_values("_sort_date", ascending=False, na_position="last")
+            for _, item in news_df.iterrows():
+                title = str(item.get("title") or "Untitled article")
+                url = str(item.get("url") or "")
+                publisher = str(item.get("publisher") or "News source")
+                published = str(item.get("published") or "")
+                ticker_label = str(item.get("Ticker") or "")
+                if url:
+                    st.markdown(f"- **{ticker_label}** · [{title}]({url}) — *{publisher}* · {published}")
+        else:
+            st.warning("No articles were retrieved from the configured news sources.")
+        with st.expander("News feed diagnostics"):
+            st.dataframe(pd.DataFrame(source_status), use_container_width=True, hide_index=True)
     st.divider()
     st.markdown("**Research checklist**")
     st.write("- Read the latest 10-Q/10-K and any material 8-K.")
@@ -547,18 +632,50 @@ with tabs[5]:
     st.write("- Treat technical indicators as descriptive signals, not forecasts.")
 
 with tabs[6]:
-    st.subheader("Congressional trading disclosures")
-    st.warning("There is no single complete, standardised, real-time official API for all congressional trades. Disclosures can be delayed and reported in value ranges.")
-    st.markdown("Official sources: [U.S. House financial disclosures](https://disclosures-clerk.house.gov/) · [U.S. Senate eFD](https://efdsearch.senate.gov/search/)")
-    upload = st.file_uploader("Import a congressional disclosure CSV",type=["csv"])
+    st.subheader("Congressional trading disclosures — watchlist")
+    st.warning(
+        "Congressional disclosures are delayed and reported in value ranges. "
+        "There is no single complete, standardised official real-time feed. "
+        "Transactions below are shown only when supplied in an imported dataset."
+    )
+    st.markdown(
+        "Official sources: [U.S. House financial disclosures](https://disclosures-clerk.house.gov/FinancialDisclosure) · "
+        "[U.S. Senate eFD](https://efdsearch.senate.gov/search/)"
+    )
+    upload = st.file_uploader(
+        "Import a congressional disclosure CSV",
+        type=["csv"],
+        help="Expected columns: Ticker, Member, Chamber, Transaction Date, Filed Date, Transaction Type, Amount Range, Source URL.",
+    )
     try:
         congress = load_congress_trades(upload)
         if not congress.empty:
-            st.dataframe(congress,use_container_width=True,hide_index=True,column_config={"Source URL":st.column_config.LinkColumn("Disclosure",display_text="Open source")})
+            congress_symbols = sorted(congress["Ticker"].dropna().unique().tolist())
+            selected_congress_symbols = st.multiselect(
+                "Filter by watchlist ticker",
+                ["All"] + congress_symbols,
+                default=["All"],
+                key="congress_ticker_filter",
+            )
+            if selected_congress_symbols and "All" not in selected_congress_symbols:
+                congress = congress[congress["Ticker"].isin(selected_congress_symbols)]
+            st.metric("Disclosures in view", len(congress))
+            st.dataframe(
+                congress,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Source URL": st.column_config.LinkColumn("Disclosure", display_text="Open source")
+                },
+            )
         else:
-            st.info("No congressional transactions imported. Upload a CSV from an official disclosure source or a data provider.")
+            st.info(
+                "No congressional transactions are loaded yet. Import a CSV from an official "
+                "disclosure source or a data provider. We do not invent trades or scrape an "
+                "unverified feed."
+            )
     except Exception as e:
-        st.error(str(e))
+        st.error(f"Congressional CSV issue: {e}")
 
 st.divider()
 st.caption("Data quality note: Yahoo Finance data is not an exchange-grade real-time feed. SEC filings are primary-source disclosures. Congressional trades require source-by-source verification. This dashboard is for research, not financial advice.")
