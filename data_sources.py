@@ -51,81 +51,136 @@ def fetch_company_info(ticker: str) -> dict:
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_news_diagnostics(ticker: str) -> dict:
-    """Fetch company news from Yahoo, Google News RSS, then Bing News RSS."""
+    """Fetch and clean company news from Yahoo Finance, Google News and Bing News."""
+    import re
     import xml.etree.ElementTree as ET
-    from urllib.parse import quote
+    from urllib.parse import quote, urlsplit, urlunsplit, parse_qsl, urlencode
 
+    symbol = ticker.upper().strip()
+    query = quote(f'"{symbol}" stock')
     items = []
     sources_checked = []
     errors = []
-    query = quote(f"{ticker} stock")
-    
-    # Yahoo Finance is attempted first; its response format varies by yfinance version.
+    seen_urls = set()
+
+    # These are data/product pages, not news reporting.
+    excluded_url_terms = (
+        "/options", "/option-chain", "/chart/", "/quote/",
+        "/history", "/key-statistics", "/holders", "/profile",
+    )
+    excluded_title_patterns = (
+        r"\b(stock price|price, news, quote|interactive stock chart|"
+        r"stock options chain|option chain|historical data)\b",
+    )
+
+    def clean_url(value):
+        if not value:
+            return ""
+        try:
+            parts = urlsplit(value.strip())
+            if parts.scheme not in ("http", "https") or not parts.netloc:
+                return ""
+            # Remove tracking parameters so syndicated copies collapse to one URL.
+            tracking = {"utm_source", "utm_medium", "utm_campaign", "guccounter", "ocid"}
+            query_items = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                           if k.lower() not in tracking and not k.lower().startswith("utm_")]
+            return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"),
+                               urlencode(query_items), ""))
+        except Exception:
+            return ""
+
+    def add_item(title, url, publisher, published, source):
+        title = re.sub(r"\s+", " ", str(title or "")).strip()
+        url = clean_url(url)
+        if not title or not url:
+            return
+        if any(term in url.lower() for term in excluded_url_terms):
+            return
+        if any(re.search(pattern, title, flags=re.I) for pattern in excluded_title_patterns):
+            return
+        key = url.lower()
+        if key in seen_urls:
+            return
+        seen_urls.add(key)
+        items.append({
+            "title": title, "url": url,
+            "publisher": str(publisher or source),
+            "published": published or "", "source": source,
+        })
+
+    # Yahoo Finance response structure differs across yfinance releases.
     sources_checked.append("Yahoo Finance")
     try:
-        raw_items = yf.Ticker(ticker).news or []
-        for raw in raw_items[:15]:
-            content = raw.get("content", raw)
-            title = content.get("title") or raw.get("title")
-            url = content.get("canonicalUrl", {}).get("url") or raw.get("link") or ""
-            provider = content.get("provider", {}).get("displayName") or raw.get("publisher") or "Yahoo Finance"
-            if title and url:
-                items.append({
-                    "title": title, "url": url, "publisher": provider,
-                    "published": content.get("pubDate") or raw.get("providerPublishTime") or "",
-                    "source": "Yahoo Finance",
-                })
+        raw_items = yf.Ticker(symbol).news or []
+        for raw in raw_items[:20]:
+            content = raw.get("content") or raw
+            canonical = content.get("canonicalUrl") or {}
+            provider = content.get("provider") or {}
+            add_item(
+                content.get("title") or raw.get("title"),
+                canonical.get("url") or raw.get("link"),
+                provider.get("displayName") or raw.get("publisher") or "Yahoo Finance",
+                content.get("pubDate") or raw.get("providerPublishTime") or "",
+                "Yahoo Finance",
+            )
     except Exception as exc:
-        errors.append(f"Yahoo Finance: {type(exc).__name__}: {str(exc)[:180]}")
+        errors.append(f"Yahoo Finance: {type(exc).__name__}: {str(exc)[:160]}")
 
-    if items:
-        return {
-            "items": items[:20], "sources_checked": sources_checked,
-            "status": "Articles found", "diagnostic": "Yahoo Finance returned articles."
-        }
-
+    # Always supplement Yahoo with RSS so the watchlist is not dependent on one feed.
     rss_sources = [
-        (
-            "Google News RSS",
-            f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en",
-        ),
-        (
-            "Bing News RSS",
-            f"https://www.bing.com/news/search?q={query}&format=RSS",
-        ),
+        ("Google News RSS",
+         f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"),
+        ("Bing News RSS",
+         f"https://www.bing.com/news/search?q={query}&format=RSS"),
     ]
-    for source_name, url in rss_sources:
+    for source_name, feed_url in rss_sources:
         sources_checked.append(source_name)
         try:
             response = requests.get(
-                url,
+                feed_url,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; StockIntelligenceDashboard/1.0)"},
-                timeout=15,
+                timeout=12,
             )
             response.raise_for_status()
             root = ET.fromstring(response.content)
-            parsed = []
-            for entry in root.findall("./channel/item")[:15]:
-                title = entry.findtext("title") or ""
-                link = entry.findtext("link") or ""
-                publisher = entry.findtext("source") or source_name
-                published = entry.findtext("pubDate") or ""
-                if title and link:
-                    parsed.append({
-                        "title": title, "url": link, "publisher": publisher,
-                        "published": published, "source": source_name,
-                    })
-            if parsed:
-                items.extend(parsed)
-                break
-            errors.append(f"{source_name}: feed responded but contained no readable articles")
+            entries = root.findall("./channel/item")
+            before = len(items)
+            for entry in entries[:20]:
+                add_item(
+                    entry.findtext("title"),
+                    entry.findtext("link"),
+                    entry.findtext("source") or source_name,
+                    entry.findtext("pubDate") or "",
+                    source_name,
+                )
+            if len(items) == before:
+                errors.append(f"{source_name}: no new readable articles")
         except Exception as exc:
-            errors.append(f"{source_name}: {type(exc).__name__}: {str(exc)[:180]}")
+            errors.append(f"{source_name}: {type(exc).__name__}: {str(exc)[:160]}")
 
-    status = "Articles found" if items else "All sources unavailable or empty"
+    # Newest first; leave undated entries at the bottom.
+    if items:
+        dated = []
+        for item in items:
+            try:
+                stamp = pd.to_datetime(item["published"], errors="coerce", utc=True)
+                # Yahoo providerPublishTime is Unix seconds, not nanoseconds.
+                if isinstance(item["published"], (int, float)) and item["published"] > 10**9:
+                    stamp = pd.to_datetime(item["published"], unit="s", errors="coerce", utc=True)
+                dated.append(stamp)
+            except Exception:
+                dated.append(pd.NaT)
+        for item, stamp in zip(items, dated):
+            item["_sort_date"] = stamp
+        items.sort(key=lambda x: x["_sort_date"] if pd.notna(x["_sort_date"]) else pd.Timestamp.min.tz_localize("UTC"),
+                   reverse=True)
+        for item in items:
+            item.pop("_sort_date", None)
+
+    status = "Articles found" if items else "No relevant articles found"
     diagnostic = " | ".join(errors) if errors else (
-        "At least one configured source returned articles." if items
-        else "Sources returned no articles and no detailed error."
+        "News feeds returned articles; duplicates and non-news quote/options pages were filtered."
+        if items else "All configured sources returned no usable news."
     )
     return {
         "items": items[:30],
@@ -133,7 +188,6 @@ def fetch_news_diagnostics(ticker: str) -> dict:
         "status": status,
         "diagnostic": diagnostic,
     }
-
 
 def fetch_news(ticker: str) -> list:
     """Backward-compatible simple news-list interface."""
