@@ -44,7 +44,7 @@ def fetch_company_info(ticker: str) -> dict:
         info = yf.Ticker(ticker).get_info()
         fields = ["longName", "sector", "industry", "marketCap", "trailingPE",
                   "forwardPE", "priceToBook", "enterpriseToEbitda", "totalRevenue",
-                  "profitMargins", "debtToEquity", "returnOnEquity", "website"]
+                  "profitMargins", "debtToEquity", "returnOnEquity", "website",\n                  "revenueGrowth", "operatingMargins", "currentRatio"]
         return {k: info.get(k) for k in fields}
     except Exception:
         return {}
