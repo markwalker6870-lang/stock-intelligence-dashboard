@@ -181,7 +181,7 @@ if rows:
         risk_cash = account * risk_pct / 100
         shares = math.floor(risk_cash / (entry-stop))
         st.metric("Maximum shares by stop risk", shares)
-        st.write(f"Planned loss at stop: US\${shares*(entry-stop):,.2f}, before spread, fees and slippage. Position value: US\${shares*entry:,.2f}.")
+        st.write(f"Planned loss at stop: US${shares*(entry-stop):,.2f}, before spread, fees and slippage. Position value: US${shares*entry:,.2f}.")
     else:
         st.caption("Enter an entry and a stop below entry to calculate a risk-based share quantity.")
     st.caption("Research tool only. It does not execute trades, guarantee fills or predict returns.")
